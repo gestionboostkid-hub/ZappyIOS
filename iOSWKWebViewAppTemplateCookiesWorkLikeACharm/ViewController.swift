@@ -35,7 +35,7 @@ class ViewController: UIViewController {
             webView.leftAnchor.constraint(equalTo: view.leftAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             webView.rightAnchor.constraint(equalTo: view.rightAnchor),
-            webView.topAnchor.constraint(equalTo: view.topAnchor)
+            webView.topAnchor.constraint(equalTo: statusbarView.bottomAnchor) // WebView commence SOUS la status bar
         ])
         
         webView.uiDelegate = self
@@ -125,6 +125,13 @@ extension ViewController: WKUIDelegate, WKNavigationDelegate {
         }
         webView.loadDiskCookies(for: host) {
             decisionHandler(.allow)
+        }
+    }
+    
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        // Recharge la page si le réseau est indispo au démarrage
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            self.webView.load(URLRequest(url: self.webURL))
         }
     }
     
