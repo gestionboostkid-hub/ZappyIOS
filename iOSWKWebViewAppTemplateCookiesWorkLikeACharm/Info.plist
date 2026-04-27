@@ -28,7 +28,7 @@
         <false/>
         <key>NSExceptionDomains</key>
         <dict>
-            <key>[zappy-family.com](http://zappy-family.com)</key>
+            <key>http://zappy-family.com</key>
             <dict>
                 <key>NSExceptionAllowsInsecureHTTPLoads</key>
                 <false/>
