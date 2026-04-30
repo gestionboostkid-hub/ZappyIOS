@@ -15,27 +15,17 @@ class ViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         
-        let statusBarHeight: CGFloat = UIApplication.shared.statusBarFrame.size.height
+        // Couleur de fond = couleur status bar (évite le flash blanc au démarrage)
+        view.backgroundColor = statusBarColor
         
-        let statusbarView = UIView()
-        statusbarView.backgroundColor = statusBarColor
-        view.addSubview(statusbarView)
-        
-        statusbarView.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            statusbarView.heightAnchor.constraint(equalToConstant: statusBarHeight),
-            statusbarView.widthAnchor.constraint(equalTo: view.widthAnchor),
-            statusbarView.topAnchor.constraint(equalTo: view.topAnchor),
-            statusbarView.centerXAnchor.constraint(equalTo: view.centerXAnchor)
-        ])
-        
+        // WebView couvre tout sauf la safe area top
         webView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(webView)
         NSLayoutConstraint.activate([
             webView.leftAnchor.constraint(equalTo: view.leftAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             webView.rightAnchor.constraint(equalTo: view.rightAnchor),
-            webView.topAnchor.constraint(equalTo: statusbarView.bottomAnchor) // WebView commence SOUS la status bar
+            webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor)
         ])
         
         webView.uiDelegate = self
@@ -50,9 +40,10 @@ class ViewController: UIViewController {
         let script = WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         webView.configuration.userContentController.addUserScript(script)
         
-        webView.load(URLRequest(url: webURL))
-        
-        view.bringSubviewToFront(statusbarView)
+        // Charge les cookies disk une seule fois avant le premier load
+        CookieManager.loadDiskCookies(for: webURL.host ?? "", into: webView) {
+            self.webView.load(URLRequest(url: self.webURL))
+        }
     }
     
     override var preferredStatusBarStyle: UIStatusBarStyle {
@@ -60,50 +51,56 @@ class ViewController: UIViewController {
     }
 }
 
-// MARK: - Cookie persistence
+// MARK: - Cookie Manager (helper séparé, évite d'étendre WKWebView système)
 
-extension WKWebView {
+class CookieManager {
     
     enum PrefKey {
         static let cookie = "cookies"
     }
     
-    func writeDiskCookies(for domain: String, completion: @escaping () -> ()) {
+    static func writeDiskCookies(for domain: String, from webView: WKWebView, completion: @escaping () -> Void) {
         fetchInMemoryCookies(for: domain) { data in
             UserDefaults.standard.setValue(data, forKey: PrefKey.cookie + domain)
             completion()
         }
     }
     
-    func loadDiskCookies(for domain: String, completion: @escaping () -> ()) {
-        if let diskCookie = UserDefaults.standard.dictionary(forKey: PrefKey.cookie + domain) {
-            fetchInMemoryCookies(for: domain) { freshCookie in
-                let mergedCookie = diskCookie.merging(freshCookie) { (_, new) in new }
-                for (_, cookieConfig) in mergedCookie {
-                    guard let cookie = cookieConfig as? [String: Any] else { continue }
-                    var expire: Any? = nil
-                    if let expireTime = cookie["Expires"] as? Double {
-                        expire = Date(timeIntervalSinceNow: expireTime)
-                    }
-                    if let newCookie = HTTPCookie(properties: [
-                        .domain: cookie["Domain"] as Any,
-                        .path: cookie["Path"] as Any,
-                        .name: cookie["Name"] as Any,
-                        .value: cookie["Value"] as Any,
-                        .secure: cookie["Secure"] as Any,
-                        .expires: expire as Any
-                    ]) {
-                        self.configuration.websiteDataStore.httpCookieStore.setCookie(newCookie)
+    static func loadDiskCookies(for domain: String, into webView: WKWebView, completion: @escaping () -> Void) {
+        guard let diskCookie = UserDefaults.standard.dictionary(forKey: PrefKey.cookie + domain) else {
+            completion()
+            return
+        }
+        fetchInMemoryCookies(for: domain) { freshCookie in
+            let mergedCookie = diskCookie.merging(freshCookie) { (_, new) in new }
+            let group = DispatchGroup()
+            for (_, cookieConfig) in mergedCookie {
+                guard let cookie = cookieConfig as? [String: Any] else { continue }
+                var expire: Any? = nil
+                if let expireTime = cookie["Expires"] as? Double {
+                    expire = Date(timeIntervalSinceNow: expireTime)
+                }
+                if let newCookie = HTTPCookie(properties: [
+                    .domain: cookie["Domain"] as Any,
+                    .path: cookie["Path"] as Any,
+                    .name: cookie["Name"] as Any,
+                    .value: cookie["Value"] as Any,
+                    .secure: cookie["Secure"] as Any,
+                    .expires: expire as Any
+                ]) {
+                    group.enter()
+                    webView.configuration.websiteDataStore.httpCookieStore.setCookie(newCookie) {
+                        group.leave()
                     }
                 }
+            }
+            group.notify(queue: .main) {
                 completion()
             }
-        } else {
-            completion()
         }
     }
     
-    func fetchInMemoryCookies(for domain: String, completion: @escaping ([String: Any]) -> ()) {
+    static func fetchInMemoryCookies(for domain: String, completion: @escaping ([String: Any]) -> Void) {
         var cookieDict = [String: AnyObject]()
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
             for cookie in cookies where cookie.domain.contains(domain) {
@@ -118,21 +115,16 @@ extension WKWebView {
 
 extension ViewController: WKUIDelegate, WKNavigationDelegate {
     
-    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        guard let host = webURL.host else {
-            decisionHandler(.cancel)
-            return
-        }
-        webView.loadDiskCookies(for: host) {
-            decisionHandler(.allow)
-        }
-    }
-    
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        // Recharge la page si le réseau est indispo au démarrage
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+        let alert = UIAlertController(
+            title: "Pas de connexion",
+            message: "Vérifie ta connexion internet et réessaie.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Réessayer", style: .default) { _ in
             self.webView.load(URLRequest(url: self.webURL))
-        }
+        })
+        present(alert, animated: true)
     }
     
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
@@ -140,8 +132,12 @@ extension ViewController: WKUIDelegate, WKNavigationDelegate {
             decisionHandler(.cancel)
             return
         }
-        webView.writeDiskCookies(for: host) {
+        CookieManager.writeDiskCookies(for: host, from: webView) {
             decisionHandler(.allow)
         }
+    }
+    
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        decisionHandler(.allow)
     }
 }
