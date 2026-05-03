@@ -6,28 +6,72 @@
 import UIKit
 import WebKit
 import Security
+import os.log
 
 class ViewController: UIViewController {
 
-    private let webView = WKWebView(frame: .zero)
+    private var webView: WKWebView!
     private let spinner = UIActivityIndicatorView(style: .large)
-    private let statusBarColor = UIColor(red: 0.655, green: 0.545, blue: 0.980, alpha: 1) // #A78BFA
+    private let progressBar = UIProgressView(progressViewStyle: .bar)
+    private let statusBarColor = UIColor(red: 0.655, green: 0.545, blue: 0.980, alpha: 1)
+    private var progressObservation: NSKeyValueObservation?
 
-    private let webURL: URL = {
-        guard let urlString = Bundle.main.infoDictionary?["AppURL"] as? String,
-              let url = URL(string: urlString) else {
-            fatalError("AppURL manquante ou invalide dans Info.plist")
+    // FIX: fallback gracieux au lieu de fatalError
+    private lazy var webURL: URL = {
+        if let urlString = Bundle.main.infoDictionary?["AppURL"] as? String,
+           let url = URL(string: urlString) {
+            return url
         }
-        return url
+        return URL(string: "https://zappy-family.com")!
     }()
 
     override func viewDidLoad() {
         super.viewDidLoad()
-
         view.backgroundColor = statusBarColor
+        setupWebView()
+        setupProgressBar()
+        setupSpinner()
+        setupRefreshControl()
+        loadInitialPage()
 
+        // Deep link : rechargement si l'app est ouverte depuis l'extérieur
+        NotificationCenter.default.addObserver(self, selector: #selector(handleDeepLink(_:)),
+                                               name: .zappyDeepLink, object: nil)
+    }
+
+    // MARK: - Setup
+
+    private func setupWebView() {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+
+        // FIX: injection de script filtrée au domaine cible uniquement
+        let targetHost = webURL.host ?? ""
+        let source = """
+        (function() {
+            var h = window.location.hostname;
+            if (h === '\(targetHost)' || h.endsWith('.\(targetHost)')) {
+                if (!document.querySelector('meta[name=viewport]')) {
+                    var m = document.createElement('meta');
+                    m.name = 'viewport';
+                    m.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
+                    document.getElementsByTagName('head')[0].appendChild(m);
+                }
+            }
+        })();
+        """
+        let script = WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        config.userContentController.addUserScript(script)
+
+        webView = WKWebView(frame: .zero, configuration: config)
+        webView.uiDelegate = self
+        webView.navigationDelegate = self
+        // FEATURE: swipe arrière/avant natif
+        webView.allowsBackForwardNavigationGestures = true
+        webView.scrollView.bounces = true
         webView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(webView)
+
         NSLayoutConstraint.activate([
             webView.leftAnchor.constraint(equalTo: view.leftAnchor),
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -35,17 +79,30 @@ class ViewController: UIViewController {
             webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor)
         ])
 
-        webView.uiDelegate = self
-        webView.navigationDelegate = self
+        // FEATURE: barre de progression liée à estimatedProgress
+        progressObservation = webView.observe(\.estimatedProgress, options: .new) { [weak self] _, change in
+            guard let self, let progress = change.newValue else { return }
+            DispatchQueue.main.async {
+                self.progressBar.setProgress(Float(progress), animated: true)
+                self.progressBar.isHidden = progress >= 1.0
+            }
+        }
+    }
 
-        let source = "var meta = document.createElement('meta');" +
-            "meta.name = 'viewport';" +
-            "meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';" +
-            "var head = document.getElementsByTagName('head')[0];" +
-            "head.appendChild(meta);"
-        let script = WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
-        webView.configuration.userContentController.addUserScript(script)
+    private func setupProgressBar() {
+        progressBar.progressTintColor = .white
+        progressBar.trackTintColor = statusBarColor
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(progressBar)
+        NSLayoutConstraint.activate([
+            progressBar.leftAnchor.constraint(equalTo: view.leftAnchor),
+            progressBar.rightAnchor.constraint(equalTo: view.rightAnchor),
+            progressBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            progressBar.heightAnchor.constraint(equalToConstant: 2)
+        ])
+    }
 
+    private func setupSpinner() {
         spinner.color = .white
         spinner.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(spinner)
@@ -54,14 +111,67 @@ class ViewController: UIViewController {
             spinner.centerYAnchor.constraint(equalTo: view.centerYAnchor)
         ])
         spinner.startAnimating()
+    }
 
+    private func setupRefreshControl() {
+        // FEATURE: pull-to-refresh
+        let refresh = UIRefreshControl()
+        refresh.tintColor = .white
+        refresh.addTarget(self, action: #selector(refreshPage), for: .valueChanged)
+        webView.scrollView.refreshControl = refresh
+    }
+
+    private func loadInitialPage() {
         CookieManager.loadCookies(for: webURL.host ?? "", into: webView) {
             self.webView.load(URLRequest(url: self.webURL))
         }
     }
 
-    override var preferredStatusBarStyle: UIStatusBarStyle {
-        return .lightContent
+    // MARK: - Actions
+
+    @objc private func refreshPage() {
+        // FEATURE: haptic au refresh
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        webView.reload()
+    }
+
+    @objc private func handleDeepLink(_ notification: Notification) {
+        guard let url = notification.object as? URL else { return }
+        webView.load(URLRequest(url: url))
+    }
+
+    // MARK: - State helpers
+
+    private func hideLoadingState() {
+        spinner.isHidden = true
+        spinner.stopAnimating()
+        webView.scrollView.refreshControl?.endRefreshing()
+    }
+
+    private func showNetworkError() {
+        hideLoadingState()
+        // FEATURE: haptic d'erreur
+        UINotificationFeedbackGenerator().notificationOccurred(.error)
+        let alert = UIAlertController(
+            title: "Pas de connexion",
+            message: "Vérifie ta connexion internet et réessaie.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Réessayer", style: .default) { [weak self] _ in
+            guard let self else { return }
+            spinner.isHidden = false
+            spinner.startAnimating()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            webView.load(URLRequest(url: webURL))
+        })
+        present(alert, animated: true)
+    }
+
+    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+
+    deinit {
+        progressObservation?.invalidate()
+        NotificationCenter.default.removeObserver(self)
     }
 }
 
@@ -69,11 +179,15 @@ class ViewController: UIViewController {
 
 class CookieManager {
 
+    private static let logger = Logger(subsystem: "com.zappy", category: "CookieManager")
+
     private static func keychainKey(for domain: String) -> String {
         return "cookies_\(domain)"
     }
 
     static func saveCookies(for domain: String, from webView: WKWebView, completion: @escaping () -> Void) {
+        // FIX: guard domain vide
+        guard !domain.isEmpty else { completion(); return }
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
             let domainCookies = cookies.filter { $0.domain.contains(domain) }
             var cookieArray: [[String: Any]] = []
@@ -86,7 +200,6 @@ class CookieManager {
                     "Secure": cookie.isSecure
                 ]
                 if let expiresDate = cookie.expiresDate {
-                    // Stocke une date absolue pour éviter la dérive à la relecture
                     props["Expires"] = expiresDate.timeIntervalSince1970
                 }
                 cookieArray.append(props)
@@ -96,24 +209,29 @@ class CookieManager {
                 return
             }
             let key = keychainKey(for: domain)
-            let query: [String: Any] = [
+            let deleteQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrAccount as String: key
             ]
-            SecItemDelete(query as CFDictionary)
+            SecItemDelete(deleteQuery as CFDictionary)
             let addQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrAccount as String: key,
                 kSecValueData as String: data,
-                // Non exportable hors device, accessible seulement écran déverrouillé
                 kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
             ]
-            SecItemAdd(addQuery as CFDictionary, nil)
+            // FIX: vérification du status Keychain
+            let status = SecItemAdd(addQuery as CFDictionary, nil)
+            if status != errSecSuccess {
+                logger.error("SecItemAdd failed: \(status)")
+            }
             completion()
         }
     }
 
     static func loadCookies(for domain: String, into webView: WKWebView, completion: @escaping () -> Void) {
+        // FIX: guard domain vide
+        guard !domain.isEmpty else { completion(); return }
         let key = keychainKey(for: domain)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -138,7 +256,6 @@ class CookieManager {
                 .secure: props["Secure"] as Any
             ]
             if let expireTimestamp = props["Expires"] as? Double {
-                // Restitue la date absolue stockée
                 cookieProps[.expires] = Date(timeIntervalSince1970: expireTimestamp)
             }
             if let cookie = HTTPCookie(properties: cookieProps) {
@@ -159,33 +276,30 @@ class CookieManager {
 extension ViewController: WKUIDelegate, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        spinner.isHidden = true
-        spinner.stopAnimating()
-        // Sauvegarde unique en fin de chargement, pas à chaque réponse HTTP
+        hideLoadingState()
+        // FEATURE: haptic de succès au chargement
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
         guard let host = webURL.host else { return }
         CookieManager.saveCookies(for: host, from: webView) {}
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        spinner.stopAnimating()
-        let alert = UIAlertController(
-            title: "Pas de connexion",
-            message: "Vérifie ta connexion internet et réessaie.",
-            preferredStyle: .alert
-        )
-        alert.addAction(UIAlertAction(title: "Réessayer", style: .default) { _ in
-            self.spinner.isHidden = false
-            self.spinner.startAnimating()
-            self.webView.load(URLRequest(url: self.webURL))
-        })
-        present(alert, animated: true)
+        // FIX: spinner.isHidden correctement géré via hideLoadingState()
+        showNetworkError()
     }
 
-    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+    // FIX: erreurs mid-navigation également capturées
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        showNetworkError()
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         decisionHandler(.allow)
     }
 
-    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url,
            let host = url.host,
            let appHost = webURL.host,
@@ -196,4 +310,10 @@ extension ViewController: WKUIDelegate, WKNavigationDelegate {
         }
         decisionHandler(.allow)
     }
+}
+
+// MARK: - Notification name
+
+extension Notification.Name {
+    static let zappyDeepLink = Notification.Name("zappyDeepLink")
 }
