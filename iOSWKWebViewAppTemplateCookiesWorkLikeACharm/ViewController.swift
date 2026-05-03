@@ -26,7 +26,6 @@ class ViewController: UIViewController {
 
         view.backgroundColor = statusBarColor
 
-        // WebView couvre tout sauf la safe area top
         webView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(webView)
         NSLayoutConstraint.activate([
@@ -39,7 +38,6 @@ class ViewController: UIViewController {
         webView.uiDelegate = self
         webView.navigationDelegate = self
 
-        // Désactive le pinch-to-zoom
         let source = "var meta = document.createElement('meta');" +
             "meta.name = 'viewport';" +
             "meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';" +
@@ -48,7 +46,6 @@ class ViewController: UIViewController {
         let script = WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         webView.configuration.userContentController.addUserScript(script)
 
-        // Spinner de chargement centré
         spinner.color = .white
         spinner.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(spinner)
@@ -58,7 +55,6 @@ class ViewController: UIViewController {
         ])
         spinner.startAnimating()
 
-        // Charge les cookies avant le premier load
         CookieManager.loadCookies(for: webURL.host ?? "", into: webView) {
             self.webView.load(URLRequest(url: self.webURL))
         }
@@ -90,7 +86,8 @@ class CookieManager {
                     "Secure": cookie.isSecure
                 ]
                 if let expiresDate = cookie.expiresDate {
-                    props["Expires"] = expiresDate.timeIntervalSinceNow
+                    // Stocke une date absolue pour éviter la dérive à la relecture
+                    props["Expires"] = expiresDate.timeIntervalSince1970
                 }
                 cookieArray.append(props)
             }
@@ -108,7 +105,8 @@ class CookieManager {
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrAccount as String: key,
                 kSecValueData as String: data,
-                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+                // Non exportable hors device, accessible seulement écran déverrouillé
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
             ]
             SecItemAdd(addQuery as CFDictionary, nil)
             completion()
@@ -139,8 +137,9 @@ class CookieManager {
                 .path: props["Path"] as Any,
                 .secure: props["Secure"] as Any
             ]
-            if let expireInterval = props["Expires"] as? Double {
-                cookieProps[.expires] = Date(timeIntervalSinceNow: expireInterval)
+            if let expireTimestamp = props["Expires"] as? Double {
+                // Restitue la date absolue stockée
+                cookieProps[.expires] = Date(timeIntervalSince1970: expireTimestamp)
             }
             if let cookie = HTTPCookie(properties: cookieProps) {
                 group.enter()
@@ -160,8 +159,11 @@ class CookieManager {
 extension ViewController: WKUIDelegate, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        spinner.isHidden = true
         spinner.stopAnimating()
-        spinner.removeFromSuperview()
+        // Sauvegarde unique en fin de chargement, pas à chaque réponse HTTP
+        guard let host = webURL.host else { return }
+        CookieManager.saveCookies(for: host, from: webView) {}
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -172,6 +174,7 @@ extension ViewController: WKUIDelegate, WKNavigationDelegate {
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "Réessayer", style: .default) { _ in
+            self.spinner.isHidden = false
             self.spinner.startAnimating()
             self.webView.load(URLRequest(url: self.webURL))
         })
@@ -179,19 +182,14 @@ extension ViewController: WKUIDelegate, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        guard let host = webURL.host else {
-            decisionHandler(.cancel)
-            return
-        }
-        CookieManager.saveCookies(for: host, from: webView) {
-            decisionHandler(.allow)
-        }
+        decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url,
            let host = url.host,
-           !host.contains(webURL.host ?? "") {
+           let appHost = webURL.host,
+           host != appHost && !host.hasSuffix(".\(appHost)") {
             UIApplication.shared.open(url)
             decisionHandler(.cancel)
             return
