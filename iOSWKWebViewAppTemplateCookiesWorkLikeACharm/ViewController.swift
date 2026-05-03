@@ -8,6 +8,13 @@ import WebKit
 import Security
 import os.log
 
+// Stocke l'URL d'un deep link arrivé avant que ViewController soit prêt (cold start)
+enum DeepLinkRouter {
+    private static var _pending: URL?
+    static func store(_ url: URL) { _pending = url }
+    static func consumePending() -> URL? { defer { _pending = nil }; return _pending }
+}
+
 class ViewController: UIViewController {
 
     private var webView: WKWebView!
@@ -16,7 +23,6 @@ class ViewController: UIViewController {
     private let statusBarColor = UIColor(red: 0.655, green: 0.545, blue: 0.980, alpha: 1)
     private var progressObservation: NSKeyValueObservation?
 
-    // FIX: fallback gracieux au lieu de fatalError
     private lazy var webURL: URL = {
         if let urlString = Bundle.main.infoDictionary?["AppURL"] as? String,
            let url = URL(string: urlString) {
@@ -32,11 +38,10 @@ class ViewController: UIViewController {
         setupProgressBar()
         setupSpinner()
         setupRefreshControl()
-        loadInitialPage()
 
-        // Deep link : rechargement si l'app est ouverte depuis l'extérieur
         NotificationCenter.default.addObserver(self, selector: #selector(handleDeepLink(_:)),
                                                name: .zappyDeepLink, object: nil)
+        loadInitialPage()
     }
 
     // MARK: - Setup
@@ -45,7 +50,6 @@ class ViewController: UIViewController {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
 
-        // FIX: injection de script filtrée au domaine cible uniquement
         let targetHost = webURL.host ?? ""
         let source = """
         (function() {
@@ -66,7 +70,6 @@ class ViewController: UIViewController {
         webView = WKWebView(frame: .zero, configuration: config)
         webView.uiDelegate = self
         webView.navigationDelegate = self
-        // FEATURE: swipe arrière/avant natif
         webView.allowsBackForwardNavigationGestures = true
         webView.scrollView.bounces = true
         webView.translatesAutoresizingMaskIntoConstraints = false
@@ -79,7 +82,6 @@ class ViewController: UIViewController {
             webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor)
         ])
 
-        // FEATURE: barre de progression liée à estimatedProgress
         progressObservation = webView.observe(\.estimatedProgress, options: .new) { [weak self] _, change in
             guard let self, let progress = change.newValue else { return }
             DispatchQueue.main.async {
@@ -114,7 +116,6 @@ class ViewController: UIViewController {
     }
 
     private func setupRefreshControl() {
-        // FEATURE: pull-to-refresh
         let refresh = UIRefreshControl()
         refresh.tintColor = .white
         refresh.addTarget(self, action: #selector(refreshPage), for: .valueChanged)
@@ -122,15 +123,17 @@ class ViewController: UIViewController {
     }
 
     private func loadInitialPage() {
-        CookieManager.loadCookies(for: webURL.host ?? "", into: webView) {
-            self.webView.load(URLRequest(url: self.webURL))
+        CookieManager.loadCookies(for: webURL.host ?? "", into: webView) { [weak self] in
+            guard let self else { return }
+            // Si un deep link est arrivé avant qu'on soit prêt (cold start), on le prioritise
+            let target = DeepLinkRouter.consumePending() ?? webURL
+            webView.load(URLRequest(url: target))
         }
     }
 
     // MARK: - Actions
 
     @objc private func refreshPage() {
-        // FEATURE: haptic au refresh
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         webView.reload()
     }
@@ -150,7 +153,6 @@ class ViewController: UIViewController {
 
     private func showNetworkError() {
         hideLoadingState()
-        // FEATURE: haptic d'erreur
         UINotificationFeedbackGenerator().notificationOccurred(.error)
         let alert = UIAlertController(
             title: "Pas de connexion",
@@ -175,62 +177,71 @@ class ViewController: UIViewController {
     }
 }
 
-// MARK: - Cookie Manager (stockage Keychain)
+// MARK: - Cookie Manager
 
-class CookieManager {
+enum CookieManager {
 
     private static let logger = Logger(subsystem: "com.zappy", category: "CookieManager")
 
+    private enum Key {
+        static let name = "Name"
+        static let value = "Value"
+        static let domain = "Domain"
+        static let path = "Path"
+        static let secure = "Secure"
+        static let expires = "Expires"
+    }
+
     private static func keychainKey(for domain: String) -> String {
-        return "cookies_\(domain)"
+        "cookies_\(domain)"
     }
 
     static func saveCookies(for domain: String, from webView: WKWebView, completion: @escaping () -> Void) {
-        // FIX: guard domain vide
         guard !domain.isEmpty else { completion(); return }
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-            let domainCookies = cookies.filter { $0.domain.contains(domain) }
+            let domainCookies = cookies.filter {
+                $0.domain == domain || $0.domain.hasSuffix(".\(domain)")
+            }
             var cookieArray: [[String: Any]] = []
             for cookie in domainCookies {
                 var props: [String: Any] = [
-                    "Name": cookie.name,
-                    "Value": cookie.value,
-                    "Domain": cookie.domain,
-                    "Path": cookie.path,
-                    "Secure": cookie.isSecure
+                    Key.name: cookie.name,
+                    Key.value: cookie.value,
+                    Key.domain: cookie.domain,
+                    Key.path: cookie.path,
+                    Key.secure: cookie.isSecure
                 ]
                 if let expiresDate = cookie.expiresDate {
-                    props["Expires"] = expiresDate.timeIntervalSince1970
+                    props[Key.expires] = expiresDate.timeIntervalSince1970
                 }
                 cookieArray.append(props)
             }
             guard let data = try? JSONSerialization.data(withJSONObject: cookieArray) else {
-                completion()
-                return
+                completion(); return
             }
-            let key = keychainKey(for: domain)
-            let deleteQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrAccount as String: key
-            ]
-            SecItemDelete(deleteQuery as CFDictionary)
-            let addQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrAccount as String: key,
-                kSecValueData as String: data,
-                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            ]
-            // FIX: vérification du status Keychain
-            let status = SecItemAdd(addQuery as CFDictionary, nil)
-            if status != errSecSuccess {
-                logger.error("SecItemAdd failed: \(status)")
+            DispatchQueue.global(qos: .utility).async {
+                let key = keychainKey(for: domain)
+                let deleteQuery: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrAccount as String: key
+                ]
+                SecItemDelete(deleteQuery as CFDictionary)
+                let addQuery: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrAccount as String: key,
+                    kSecValueData as String: data,
+                    kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+                ]
+                let status = SecItemAdd(addQuery as CFDictionary, nil)
+                if status != errSecSuccess {
+                    logger.error("SecItemAdd failed: \(status)")
+                }
+                DispatchQueue.main.async { completion() }
             }
-            completion()
         }
     }
 
     static func loadCookies(for domain: String, into webView: WKWebView, completion: @escaping () -> Void) {
-        // FIX: guard domain vide
         guard !domain.isEmpty else { completion(); return }
         let key = keychainKey(for: domain)
         let query: [String: Any] = [
@@ -238,35 +249,42 @@ class CookieManager {
             kSecAttrAccount as String: key,
             kSecReturnData as String: true
         ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let cookieArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            completion()
-            return
-        }
-        let group = DispatchGroup()
-        for props in cookieArray {
-            var cookieProps: [HTTPCookiePropertyKey: Any] = [
-                .name: props["Name"] as Any,
-                .value: props["Value"] as Any,
-                .domain: props["Domain"] as Any,
-                .path: props["Path"] as Any,
-                .secure: props["Secure"] as Any
-            ]
-            if let expireTimestamp = props["Expires"] as? Double {
-                cookieProps[.expires] = Date(timeIntervalSince1970: expireTimestamp)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var result: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            guard status == errSecSuccess,
+                  let data = result as? Data,
+                  let cookieArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                DispatchQueue.main.async { completion() }
+                return
             }
-            if let cookie = HTTPCookie(properties: cookieProps) {
-                group.enter()
-                webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) {
-                    group.leave()
+            let now = Date()
+            let group = DispatchGroup()
+            for props in cookieArray {
+                if let expireTimestamp = props[Key.expires] as? Double,
+                   Date(timeIntervalSince1970: expireTimestamp) < now {
+                    continue
+                }
+                var cookieProps: [HTTPCookiePropertyKey: Any] = [
+                    .name: props[Key.name] as Any,
+                    .value: props[Key.value] as Any,
+                    .domain: props[Key.domain] as Any,
+                    .path: props[Key.path] as Any,
+                    .secure: props[Key.secure] as Any
+                ]
+                if let expireTimestamp = props[Key.expires] as? Double {
+                    cookieProps[.expires] = Date(timeIntervalSince1970: expireTimestamp)
+                }
+                if let cookie = HTTPCookie(properties: cookieProps) {
+                    group.enter()
+                    DispatchQueue.main.async {
+                        webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) {
+                            group.leave()
+                        }
+                    }
                 }
             }
-        }
-        group.notify(queue: .main) {
-            completion()
+            group.notify(queue: .main) { completion() }
         }
     }
 }
@@ -277,25 +295,17 @@ extension ViewController: WKUIDelegate, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         hideLoadingState()
-        // FEATURE: haptic de succès au chargement
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         guard let host = webURL.host else { return }
         CookieManager.saveCookies(for: host, from: webView) {}
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        // FIX: spinner.isHidden correctement géré via hideLoadingState()
         showNetworkError()
     }
 
-    // FIX: erreurs mid-navigation également capturées
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         showNetworkError()
-    }
-
-    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
-                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
